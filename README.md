@@ -1,185 +1,277 @@
-# Agent Py
+# Multi-Agent
 
-Agent Py 是一个本地优先的 AIOps 工作台。Vue 3 提供操作界面，FastAPI 提供 API 与 Agent 运行时，SQLite 保存用户归属的数据，Milvus 保存受权限控制的知识向量，腾讯云官方 CLS MCP Server 提供真实日志访问。
+基于 LangChain 与 LangGraph 的多智能体运维系统，面向知识查询、告警分析与故障排查，将 **ReAct 对话 Agent、Plan-Execute-Replan 诊断工作流、RAG 知识库和 MCP 工具**整合在同一个工作台中。
+
+Multi-Agent 以运维场景验证 Agent 的规划、执行和结果分析能力：对话 Agent 按需检索知识、调用工具；诊断工作流从告警出发检索 SOP、查询真实 CLS 日志、生成带证据的报告，并将成功诊断沉淀为可检索的故障案例。
+
+## 多智能体协作设计
+
+系统提供对话 Agent 和运维诊断两类入口。两者共享当前用户的知识库、MCP 连接与工具审计；诊断内部通过 LangGraph 将规划、执行、状态判断和报告生成拆分为职责明确的节点，通过共享状态传递计划与证据。
+
+```mermaid
+flowchart TB
+    accTitle: Multi-Agent Operations Collaboration Architecture
+    accDescr: 用户通过对话或告警诊断入口使用系统。对话 Agent 与诊断工作流共享知识检索和 MCP 工具，诊断案例可回流知识库供后续检索。
+
+    user_input["用户提问"] --> chat_agent["对话 Agent / ReAct"]
+    alert_input["活跃告警 / 诊断问题"] --> diagnosis_flow["运维诊断 / LangGraph"]
+    chat_agent --> knowledge_tool["RAG 知识检索"]
+    chat_agent --> mcp_tools["MCP 工具"]
+    diagnosis_flow --> knowledge_tool
+    diagnosis_flow --> mcp_tools
+    knowledge_tool --> knowledge_base[("Milvus / SOP 与故障案例")]
+    mcp_tools --> cls_server["腾讯云官方 CLS MCP Server"]
+    diagnosis_flow --> diagnostic_report["证据链与诊断报告"]
+    diagnostic_report --> case_library["成功诊断沉淀为案例"]
+    case_library --> knowledge_base
+```
+
+### 角色与职责
+
+| 角色 / 节点 | 主要职责 | 实现方式 |
+| --- | --- | --- |
+| 对话 Agent | 理解问题，按需检索知识、加载 Skill、调用 MCP 工具并组织回答 | LangChain `create_agent`，多轮工具调用与 SSE 输出 |
+| Planner | 检索相关 SOP，结合告警与可用工具生成诊断计划 | RAG + LLM 结构化计划 + 参数校验 |
+| Executor | 执行计划中的工具调用，记录日志证据与执行结果 | 真实 MCP 调用、工具审计、证据持久化 |
+| Replanner | 根据计划进度与执行失败状态，决定继续执行或进入报告阶段 | LangGraph 条件路由与规则判断 |
+| Report | 汇总告警、知识引用和工具证据，生成诊断报告 | LLM 报告生成与模板回退，关联证据 ID |
+
+当前诊断流程采用有界执行：Planner 将计划收敛为经过参数规范化的 CLS `SearchLog` 查询；Replanner 根据执行状态选择后续节点。规划和报告生成由 LLM 完成，执行与流程控制由程序管理。
+
+### Plan-Execute-Replan 诊断流程
+
+```mermaid
+flowchart LR
+    accTitle: Bounded Plan Execute Replan Workflow
+    accDescr: Planner 检索 SOP 并生成受限计划，Executor 查询真实日志，Replanner 判断是否继续执行。流程最终生成带证据的报告并持久化结果。
+
+    task_input["告警与诊断问题"] --> planner["Planner / 检索 SOP 与规划"]
+    planner --> executor["Executor / 工具调用与采证"]
+    executor --> replanner{"Replanner / 状态判断"}
+    replanner -->|"仍有步骤且执行未失败"| executor
+    replanner -->|"步骤结束或执行失败"| report["Report / 汇总证据"]
+    report --> persisted_result["报告与证据持久化"]
+```
+
+每个阶段都会保存执行步骤、工具调用和 checkpoint，并通过 SSE 输出计划、工具状态、知识引用、证据和报告。前端可以展示诊断过程，用户也能在历史任务中追溯报告依据。
 
 ## 当前功能
 
-以下能力均已在当前代码中实现，不包含尚未落地的规划项。
+### ReAct 对话 Agent
 
-### 账号、权限与工作台
+- **流式聊天与上下文记忆**：支持持久化会话、多轮对话、SSE 增量输出与工具调用过程展示；可按轮数、上下文占用比例或手动触发摘要压缩，保留完整历史。
+- **自主工具选择**：模型按问题需要调用知识检索、当前时间及已启用的 MCP 工具，知识检索作为可选工具参与推理与执行。
+- **Prompt 与渐进式 Skill**：支持用户配置系统 Prompt、上传和选择 `SKILL.md`；初始上下文注入 Skill 名称与描述，需要时通过 `load_skill` 加载正文。
+- **引用与反馈**：回答展示知识来源、工具状态和结果摘要，支持对回答与引用提交结构化反馈。
 
-- **用户认证**：支持注册、登录、登出、认证状态恢复和当前用户信息查询；密码使用 Argon2 安全哈希，不保存明文。
-- **用户与 tenant 隔离**：聊天、消息、知识库、文档、向量、索引任务、MCP 连接、AIOps、证据、报告、反馈和工具审计均按当前用户隔离，越权访问返回统一权限错误。
-- **中文响应式工作台**：提供对话、知识库、智能诊断和 MCP 连接四个受保护路由，桌面与移动端共用一致导航和状态表达。
-- **统一操作反馈**：成功、提示和错误消息使用全局反馈组件展示，支持手动关闭并在 3 秒后自动消失。
+### RAG 知识库
 
-### 流式聊天与 Agent
+- 支持 Markdown / PDF 上传、重复文件检测、索引状态管理，以及固定字符、Markdown 标题和段落切分与预览。
+- 使用 Embedding + Milvus HNSW/COSINE 向量检索，与 BM25L 关键词检索并行召回，通过 RRF（`k=60`）融合，再使用 Qwen rerank 精排。
+- 引用展示向量、BM25、RRF 和 rerank 的排名与分数，以及来源、chunk 摘要和 metadata。
+- 索引任务持久化执行，支持失败重试、取消和重建；文档删除同步清理向量，检索按用户及知识库权限过滤。
 
-- **持久化会话**：支持创建、切换、倒序查询、自动生成标题、清空和删除会话；SQLite 是会话与消息的主存储。
-- **流式聊天**：使用 `langchain` `create_agent`、OpenAI-compatible Qwen 和 SSE 输出内容增量、工具调用、引用、完成与错误事件，前端以可感知的打字机节奏渲染回答。
-- **自主工具调用**：模型根据问题自行决定是否调用知识库、当前时间或已启用 MCP 工具，不把 RAG 固定为每次对话的前置流程。
-- **Prompt 配置**：用户可以创建、编辑、选择和删除会话使用的系统 Prompt，服务端负责组装最终 system prompt。
-- **渐进式 Skill**：支持上传和选择符合 `SKILL.md` 规范的 Skill；初始上下文只注入 `name` 与 `description`，模型需要时再通过 `load_skill` 加载正文。
-- **会话级记忆模式**：每个会话可独立选择“每 30 轮压缩”“上下文占用 70% 自动压缩”或“手动压缩”，输入框旁展示上下文窗口占用率；压缩只生成摘要，不删除完整历史。
-- **推理与工具过程**：回答可折叠展示推理上下文、工具调用状态和结果摘要，工具调用同时写入 SQLite 审计记录。
-- **内容反馈**：用户可对助手回答和单条知识引用点赞、点踩，填写问题类型、评论和纠正内容；反馈可更新、删除并在重新打开会话后恢复。
+### AIOps 运维 Agent 与案例回流
 
-### 知识库、索引与 RAG
+- 聚合 Prometheus v1 / Alertmanager v2 **活跃告警**，支持从告警或诊断问题创建任务。
+- 基于 LangGraph 执行 Planner → Executor → Replanner → Report，结合 SOP 与真实 CLS 日志形成诊断证据链。
+- 持久化输入、计划、步骤、工具调用、证据、checkpoint 与 Markdown 报告；工具失败和知识未命中会明确记录。
+- 支持诊断历史、任务取消、步骤与报告反馈；成功诊断可自动或手动沉淀为用户知识库中的故障案例，参与后续问答与 SOP 检索。
 
-- **文档管理**：支持上传 Markdown 和 PDF，记录文件名、大小、MIME、SHA-256、上传时间与索引状态；支持重复文件检测、明确覆盖和删除时同步清理向量。
-- **切分策略与预览**：上传前可选择固定字符、Markdown 标题或段落切分；固定字符支持长度和重叠参数，前端可预览有界 chunk 结果。
-- **持久索引任务**：文档索引在后台执行，状态包含排队、执行中、成功、失败和取消；失败原因会持久化，并支持手动重试和重建索引。
-- **Embedding 与 Milvus**：调用配置的 Embedding 模型生成向量，写入 Milvus HNSW/COSINE collection；chunk metadata 包含文档、来源、切分参数和 owner/user/tenant 权限字段。
-- **混合召回与精排**：Milvus 向量搜索与内存 BM25L 关键词检索并行召回，通过 RRF（`k=60`）融合候选，再调用 Qwen rerank 模型精排。
-- **完整检索可解释性**：引用同时展示向量排名与相似度、BM25 排名与分数、RRF 分数、rerank 排名与分数，以及文档来源、chunk 摘要和 metadata。
-- **受控知识工具**：知识检索以 LangChain Tool 提供给 Agent，支持 `topK` 和知识库过滤；检索始终附带当前用户权限条件，无命中时返回空结果而不是编造内容。
+### MCP 工具与执行治理
 
-### AIOps 智能诊断
+- 通过腾讯云官方 CLS MCP Server 访问真实日志；用户可以管理多个 SSE / Streamable HTTP MCP 连接，检查连接并发现工具。
+- 对话与诊断共用用户级 MCP 配置，支持超时、重试、同名工具保护与明确失败。
+- 工具审计记录名称、参数、结果摘要、耗时、状态和错误，并关联会话或诊断任务。
 
-- **Plan-Execute-Replan**：使用 LangGraph 实现 `Planner -> Executor -> Replanner -> Report`，Planner 先检索 SOP，Executor 调用真实工具，Replanner 决定继续、调整或生成报告。
-- **真实告警入口**：聚合 Prometheus v1 和 Alertmanager v2 活跃告警，用户可刷新告警并从某条告警直接创建诊断任务。
-- **持久后台执行**：诊断由 SQLite durable job runtime 调度，不阻塞 API；页面展示排队、执行、取消、失败和完成状态，并支持用户取消任务。
-- **诊断 SSE**：实时输出计划、步骤、工具调用、证据、重规划、报告、完成和错误事件；断开后可根据持久化事件和任务数据恢复。
-- **证据链与报告**：持久化原始输入、计划、执行步骤、工具调用、日志/指标/告警/知识引用证据、checkpoint 和 Markdown 报告，报告结论可追溯到证据。
-- **诊断历史与案例库**：支持按用户查询历史任务和完整证据链；成功诊断可自动或手动沉淀为用户知识库中的故障案例并参与后续检索。
-- **诊断反馈**：用户可对单个诊断步骤和最终报告提交可恢复的结构化反馈。
+### 工程化能力
 
-### MCP 与外部系统
+- **用户认证与数据隔离**：支持注册、登录、退出和状态恢复，密码采用 Argon2 哈希；聊天、知识、向量、诊断、MCP 与审计数据按当前用户隔离。
+- **持久后台任务**：SQLite 保存任务、事件和租约，Worker 支持心跳续租、任务恢复、重试、超时与协作式取消。
+- **统一接口契约**：共享 TypeScript 类型约束 HTTP、错误码、OpenAPI 与 SSE，前后端共同使用。
+- **运行状态检查与可观测性**：提供 `/health`、`/ready`、`/config/check`、`/metrics`，请求日志与工具审计统一脱敏。
 
-- **真实 CLS MCP**：本机运行腾讯云官方 `cls-mcp-server`，后端通过 SSE 调用真实 CLS 日志、告警、指标和辅助工具，不提供 mock profile 或伪造结果。
-- **用户级 MCP 连接管理**：前端支持创建、编辑、启停和删除多个 MCP Server，配置 SSE 或 Streamable HTTP、URL、超时和重试次数。
-- **连接检查与工具发现**：可从页面检查 MCP Server，展示真实连接结果和工具列表；聊天与 AIOps 共用同一份当前用户连接配置。
-- **调用治理**：MCP 支持超时、重试、同名工具保护和明确失败；每次调用记录工具名、参数、结果摘要、耗时、状态、错误及关联会话或诊断任务。
+## 技术栈
 
-### 后台任务、存储与平台能力
+| 层次 | 技术 |
+| --- | --- |
+| Agent 与流程编排 | LangChain、LangGraph、ReAct、Plan-Execute-Replan |
+| 模型服务 | OpenAI-compatible Qwen / 百炼，Chat、Embedding、Rerank |
+| 知识检索 | Milvus、BM25L、RRF、HNSW / COSINE |
+| 工具接入 | MCP、腾讯云官方 CLS MCP Server |
+| 后端与任务 | Python、FastAPI、SQLAlchemy、SQLite、Alembic、uv |
+| 前端与流式交互 | Vue 3、TypeScript、Vite、Pinia、SSE |
+| 基础设施 | Docker Compose、etcd、MinIO、Milvus、Attu、Alertmanager |
+| 验证与规格 | pytest、Ruff、Pyright、Vitest、OpenSpec |
 
-- **Durable job runtime**：SQLite 保存后台任务、事件、尝试次数和租约；Worker 支持并发领取、心跳续租、进程重启恢复、指数退避重试、超时和协作式取消。
-- **Repository 存储边界**：SQLAlchemy 模型和 Repository 隔离业务层与 SQLite 细节，Alembic 管理迁移，并为后续替换 PostgreSQL 保留边界。
-- **统一 API 契约**：`packages/api-contracts` 是前后端共享的 HTTP、错误码、OpenAPI 和 SSE 类型来源，覆盖认证、聊天、知识库、后台任务、反馈、MCP 和 AIOps。
-- **运行状态检查与指标**：`/health` 检查存活，`/ready` 检查 SQLite、Milvus、Qwen 与 MCP，`/config/check` 校验项目配置，`/metrics` 暴露本地请求指标。
-- **结构化可观测性**：请求日志包含 request id、路径、状态和耗时；敏感字段统一脱敏，Agent/MCP 工具调用有独立审计生命周期。
-- **真实演示数据工具**：提供显式脚本上传 Java 电商事故 CLS 日志、发布本地告警和索引 SOP，可完成“告警 -> 诊断 -> 证据 -> 报告 -> 案例知识”的完整演示。
-- **本地优先启动**：Docker Compose 仅托管 etcd、MinIO、Milvus、Attu 和 Alertmanager；前端、后端与 CLS MCP Server 使用 macOS/Linux/Windows 本机启动脚本运行。
-
-## 前端入口
-
-| 路径 | 功能 |
-|------|------|
-| `/login`、`/register` | 登录与注册 |
-| `/chat` | 会话、流式 Agent、Prompt、Skill、记忆模式、引用和反馈 |
-| `/knowledge` | 文档上传、切分预览、索引、重试、详情和删除 |
-| `/aiops` | 活跃告警、实时诊断、执行链、证据、报告和案例库 |
-| `/mcp` | MCP 连接配置、启停、检查与工具发现 |
-
-## 项目结构
+## 项目结构与源码入口
 
 ```text
-apps/backend/          FastAPI、LangChain/LangGraph、SQLite、Alembic、uv
-apps/frontend/         Vue 3、Vite、TypeScript
-packages/api-contracts 共享的 TypeScript HTTP 与 SSE 契约
-config/                可提交的配置模板与被 Git 忽略的本地 JSON 配置
-infra/                 Milvus 与 Alertmanager 基础设施 Compose 资产
-scripts/               本机启动脚本
-openspec/              OpenSpec 规格、变更与归档
-docs/                  安装、架构与运维文档
+Multi-Agent/
+├── apps/backend/                 FastAPI、Agent 运行时、后台任务与数据库迁移
+│   ├── src/super_ai/
+│   │   ├── chat/                 对话 Agent、Prompt / Skill 与记忆管理
+│   │   ├── aiops/                LangGraph 诊断流程与故障案例
+│   │   ├── retrieval/            知识检索与引用
+│   │   ├── documents/            文档提取、切分与索引
+│   │   ├── jobs/                 持久后台任务
+│   │   └── api/                  HTTP / SSE 接口
+│   ├── scripts/                  日志上传、告警与 SOP 场景脚本
+│   ├── tests/                    后端测试
+│   └── alembic/                  数据库迁移
+├── apps/frontend/                中文响应式工作台
+├── packages/api-contracts/       HTTP、OpenAPI、错误码与 SSE 共享契约
+├── config/                       配置模板与本地 JSON 配置
+├── infra/                        基础设施 Compose 资产
+├── scripts/                      macOS / Linux / Windows 启动脚本
+├── openspec/                     功能规格与变更记录
+└── docs/                         项目文档与变更 WIKI
 ```
 
-## 三平台安装
+| 关注点 | 源码入口 |
+| --- | --- |
+| 对话 Agent 的工具装配与流式事件 | [chat/streaming.py](apps/backend/src/super_ai/chat/streaming.py) |
+| Planner、Executor、Replanner、Report | [aiops/diagnostics.py](apps/backend/src/super_ai/aiops/diagnostics.py) |
+| 后台任务领取、租约与恢复 | [jobs/](apps/backend/src/super_ai/jobs/) |
+| 前后端事件与接口契约 | [api-contracts/src/](packages/api-contracts/src/) |
+| 功能行为与验收场景 | [openspec/specs/](openspec/specs/) |
 
-请先按当前操作系统完成完整依赖安装：
+## 本地开发
 
-- [macOS 安装指南](docs/setup/macos.md)
-- [Linux 安装指南](docs/setup/linux.md)
-- [Windows 安装指南](docs/setup/windows.md)
+Docker Compose **只**负责运行 etcd、MinIO、Milvus、Attu 和 Alertmanager。CLS MCP Server、后端与前端直接在本机运行。
 
-三个指南均覆盖 Git、Docker、Node/npm、uv 与官方 `cls-mcp-server`。
+### 1. 准备依赖
 
-## 配置方式
-
-应用只从本地 JSON 配置文件读取项目配置，不读取本机 `.env` 文件或环境变量。首次使用时，从不含密钥的模板创建本地配置：
+需要 Git、Python 3.10+、Node.js / npm、uv 和 Docker Compose；Docker 服务应已启动。安装项目启动器使用的官方 CLS MCP Server：
 
 ```bash
+npm install -g cls-mcp-server@1.0.4
+```
+
+### 2. 获取项目并创建配置
+
+在 macOS / Linux / WSL 中执行：
+
+```bash
+git clone https://github.com/Dracary-C/Multi-Agent.git
+cd Multi-Agent
 cp config/project.template.json config/project.json
 cp config/user.project.template.json config/user.project.json
 ```
 
-- `config/project.json`：基础运行配置，仅保存在本机。
-- `config/user.project.json`：个人模型与 CLS 配置，仅保存在本机并覆盖基础配置。
-- `config/project.template.json`、`config/user.project.template.json`：可安全提交的配置模板。
+Windows PowerShell 中，在项目根目录创建配置：
 
-两个本地配置文件均被 Git 忽略。请阅读[配置与运维教程](docs/operations-and-monitoring.md)填写模型密钥、CLS 凭据与其他本机配置，禁止将真实凭据加入版本控制。
+```powershell
+Copy-Item config/project.template.json config/project.json
+Copy-Item config/user.project.template.json config/user.project.json
+```
 
-## 本地开发
+应用读取两个本地 JSON 文件，用户配置覆盖基础配置；应用项目配置不从 `.env` 或机器环境变量读取。首次启动前，在 `config/user.project.json` 中填写模型与 CLS 信息：
 
-Docker Compose **只**负责运行 etcd、MinIO、Milvus、Attu 和 Alertmanager。CLS MCP Server、后端与前端均直接在本机运行，不会通过 Compose 启动。
+| 配置项 | 用途 |
+| --- | --- |
+| `llm.apiKey` | 百炼模型服务密钥 |
+| `llm.chatModel`、`llm.embeddingModel` | 当前账户可用的对话与向量模型 |
+| `clsMcpServer.secretId`、`clsMcpServer.secretKey` | 腾讯云 CLS 访问凭据 |
+| `clsLogUpload.region`、`clsLogUpload.logsetId`、`clsLogUpload.topicId` | 日志检索与场景验证使用的地域、日志集和主题 |
 
-### 一键启动
+两个本地配置文件均被 Git 忽略，配置模板用于共享。向量模型输出维度应与 `llm.embeddingDimensions` 和 `vectorStore.vectorDimension` 保持一致。连接现有告警系统时，在本地配置中调整 `prometheusAlerts.sources`。
 
-在仓库根目录执行：
+### 3. 一键启动
+
+macOS / Linux / WSL：
 
 ```bash
 ./scripts/start-local.sh
 ```
 
-在 Windows 命令提示符中执行：
+Windows 命令提示符：
 
-```text
+```bat
 scripts\start-local.bat
 ```
 
-启动脚本会启动基础设施容器、准备项目依赖、执行 SQLite 迁移，并在本机启动 MCP、后端和前端。进程日志写入 `apps/backend/var/`。
+启动器准备基础设施、项目依赖与 SQLite 迁移，然后启动本机 MCP、后端和前端。日志写入 `apps/backend/var/`。首次使用时，在前端注册并登录账户。
 
-### 手动启动
+| 服务 | 默认地址 |
+| --- | --- |
+| 前端工作台 | `http://127.0.0.1:5173` |
+| FastAPI / 交互式接口文档 | `http://127.0.0.1:8000/docs` |
+| 后端就绪检查 | `http://127.0.0.1:8000/ready` |
+| CLS MCP SSE | `http://127.0.0.1:3000/sse` |
+| Alertmanager | `http://127.0.0.1:9093` |
+| Attu | `http://127.0.0.1:8001` |
 
-安装前端和后端依赖：
+### 手动启动应用
+
+在仓库根目录准备依赖与基础设施：
 
 ```bash
 npm install
+docker compose -f infra/compose.yaml up -d etcd minio milvus attu alertmanager
 cd apps/backend
 uv sync
 mkdir -p var
 uv run alembic upgrade head
 ```
 
-在仓库根目录启动所有容器基础设施：
+在独立终端中，从仓库根目录启动官方 CLS MCP Server。下面的命令读取本地 JSON，并将配置传给官方 CLI 进程：
 
 ```bash
-docker compose -f infra/compose.yaml up -d etcd minio milvus attu alertmanager
+python3 - <<'PY'
+import json
+import os
+import subprocess
+from pathlib import Path
+
+base = json.loads(Path("config/project.json").read_text(encoding="utf-8"))
+override = json.loads(Path("config/user.project.json").read_text(encoding="utf-8"))
+mcp = {**base["clsMcpServer"], **override.get("clsMcpServer", {})}
+cli_env = {
+    **os.environ,
+    "TRANSPORT": mcp["transport"],
+    "PORT": str(mcp["port"]),
+    "TZ": mcp["timezone"],
+    "TENCENTCLOUD_SECRET_ID": mcp["secretId"],
+    "TENCENTCLOUD_SECRET_KEY": mcp["secretKey"],
+}
+subprocess.run(["cls-mcp-server"], env=cli_env, check=True)
+PY
 ```
 
-使用 `config/project.json` 中 `clsMcpServer` 的配置启动官方 CLS MCP Server，然后启动后端：
+另开终端，在 `apps/backend` 目录启动 API：
 
 ```bash
-cd apps/backend
 uv run uvicorn super_ai.api.app:create_app --factory --host 127.0.0.1 --port 8000
 ```
 
-在第二个终端启动前端：
+另开一个终端，在仓库根目录启动前端：
 
 ```bash
 cd apps/frontend
 npm run dev -- --host 127.0.0.1
 ```
 
-本地地址：
+## 使用流程
 
-- 前端：`http://127.0.0.1:5173`
-- 后端：`http://127.0.0.1:8000`
-- 后端就绪检查：`http://127.0.0.1:8000/ready`
-- CLS MCP SSE：`http://127.0.0.1:3000/sse`
-- Alertmanager：`http://127.0.0.1:9093`
-- Milvus：`http://127.0.0.1:19530`
-- Attu：`http://127.0.0.1:8001`
+1. 在 `/knowledge` 上传运维文档、SOP 或故障记录，选择切分方式并等待索引完成。
+2. 在 `/mcp` 检查当前用户的 MCP 连接与工具列表。
+3. 在 `/chat` 进行知识问答，观察 Agent 的工具选择、知识引用和流式回答。
+4. 在 `/aiops` 刷新活跃告警，选择告警或输入问题创建诊断任务。
+5. 查看计划、工具执行、证据与报告；成功诊断可在案例库中查看，并用于后续知识检索。
 
-## 真实日志与告警教程
-
-上传 CLS 日志、发布本地 Alertmanager 告警、索引 SOP 与从前端执行 AIOps 诊断均为显式操作，不属于日常启动流程。请按照[真实日志与告警教程](docs/tutorials/real-log-and-alert.md)执行。
+项目另提供 Java 电商微服务的场景验证脚本，位于 `apps/backend/scripts/`：`generate_and_upload_cls_logs.py` 上传生成的测试日志至真实 CLS，`publish_java_ecommerce_alerts.py` 发布测试告警，`seed_java_ecommerce_aiops_sops.py` 上传并索引关联 SOP。它们需要配置对应的测试环境与 `aiopsDemo` 账户，按需显式执行。
 
 ## 验证命令
 
-在仓库根目录执行 OpenSpec 验证：
+在仓库根目录执行前端、共享契约与规格检查：
 
 ```bash
+npm run frontend:typecheck
+npm run frontend:test
+npm run frontend:build
+npm run contracts:typecheck
+npm --workspace packages/api-contracts run test
 openspec validate --all
 ```
 
@@ -191,10 +283,4 @@ uv run pyright
 uv run pytest
 ```
 
-在 `apps/frontend` 执行前端检查：
-
-```bash
-npm run typecheck
-npm run test
-npm run build
-```
+文档站构建命令为 `npm run docs:build`。系统实现与测试中的用户作用域、SSE 契约、工具失败处理和任务生命周期共同约束 Agent 执行过程。
