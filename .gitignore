@@ -1,0 +1,28 @@
+.idea/
+.DS_Store
+.env
+.env.*
+.venv/
+apps/backend/var/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+.pyright/
+node_modules/
+dist/
+coverage/
+*.tsbuildinfo
+docs/.vitepress/cache/
+docs/.vitepress/dist/
+
+# Local configuration (may contain credentials)
+/config/project.json
+/config/user.project.json
+
+# Tutorials, installation guides, and instructional examples
+/docs/tutorials/
+/docs/setup/
+/docs/examples/
+/docs/aiops/
+/docs/operations-and-monitoring.md
+/openspec从0到1项目实战的提示词.md
